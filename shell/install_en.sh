@@ -310,6 +310,9 @@ initVar() {
     # hysteria上行速度
     hysteria2ClientUploadSpeed=
 
+    # hysteria2 obfuscation (salamander) password
+    hysteria2ObfsPassword=
+
     #Reality
     realityPrivateKey=
     realityServerName=
@@ -1043,6 +1046,7 @@ readSingBoxConfig() {
             hysteriaPort=$(jq -r '.inbounds[0].listen_port' "${singBoxConfigPath}06_hysteria2_inbounds.json")
             hysteria2ClientUploadSpeed=$(jq -r '.inbounds[0].down_mbps' "${singBoxConfigPath}06_hysteria2_inbounds.json")
             hysteria2ClientDownloadSpeed=$(jq -r '.inbounds[0].up_mbps' "${singBoxConfigPath}06_hysteria2_inbounds.json")
+            hysteria2ObfsPassword=$(jq -r '.inbounds[0].obfs.password // empty' "${singBoxConfigPath}06_hysteria2_inbounds.json")
         fi
     fi
     if [[ "${coreInstallType}" == "1" && -f "${configPath}06_hysteria2_inbounds.json" ]]; then
@@ -3441,6 +3445,29 @@ initHysteria2Network() {
     fi
 }
 
+# Salamander obfuscation is only supported by sing-box's native hysteria2; Xray's hysteria implementation has no such field
+initHysteria2Obfs() {
+    if [[ -n "${hysteria2ObfsPassword}" && -z "${lastInstallationConfig}" ]]; then
+        read -r -p " Detected an enabled Hysteria2 obfuscation (salamander) password, reuse it ? [y/n]:" historyHysteria2Obfs
+        if [[ "${historyHysteria2Obfs}" != "y" ]]; then
+            hysteria2ObfsPassword=
+        else
+            echoContent yellow "\n ---> Obfuscation password : ${hysteria2ObfsPassword}\n"
+        fi
+    elif [[ -n "${hysteria2ObfsPassword}" && -n "${lastInstallationConfig}" ]]; then
+        echoContent yellow "\n ---> Obfuscation password : ${hysteria2ObfsPassword}\n"
+    fi
+
+    if [[ -z "${hysteria2ObfsPassword}" ]]; then
+        echoContent yellow " Enable Hysteria2 Salamander obfuscation ? Useful when SNI/traffic characteristics are blocked, clients must be updated accordingly ( Default : n)"
+        read -r -p " Enable [y/n]:" selectHysteria2Obfs
+        if [[ "${selectHysteria2Obfs}" == "y" ]]; then
+            hysteria2ObfsPassword=$(/etc/v2ray-agent/sing-box/sing-box generate rand 16 --hex)
+            echoContent green "\n ---> Obfuscation password : ${hysteria2ObfsPassword}\n"
+        fi
+    fi
+}
+
 # Port hopping rules are owned per protocol; never flush another firewall's rules.
 validPortHoppingConfig() {
     [[ "$1" == hysteria2 || "$1" == tuic ]] || return 1
@@ -3822,8 +3849,10 @@ buildSingBoxHysteria2Node() {
     jq -n --arg port "${port}" --arg tag "${email}" --arg password "${password}" --arg host "${currentHost}" \
         --argjson listenPort "${listenPort}" --argjson up "${hysteria2ClientUploadSpeed}" \
         --argjson down "${hysteria2ClientDownloadSpeed}" --arg interval "${hysteria2HopInterval:-60}s" \
+        --arg obfsPassword "${hysteria2ObfsPassword}" \
         '{tag:$tag,type:"hysteria2",server:$host,up_mbps:$up,down_mbps:$down,password:$password,tls:{enabled:true,server_name:$host,alpn:["h3"]}} +
-        (if $port | contains("-") then {server_ports:[($port | sub("-"; ":"))],hop_interval:$interval} else {server_port:$listenPort} end)'
+        (if $port | contains("-") then {server_ports:[($port | sub("-"; ":"))],hop_interval:$interval} else {server_port:$listenPort} end) +
+        (if $obfsPassword != "" then {obfs:{type:"salamander",password:$obfsPassword}} else {} end)'
 }
 
 # 端口跳跃
@@ -5378,6 +5407,7 @@ EOF
         mapfile -t result < <(initSingBoxPort "${singBoxHysteria2Port}")
         echoContent green "\n ---> Hysteria2 Port : ${result[-1]}"
         initHysteria2Network
+        initHysteria2Obfs
         cat <<EOF >/etc/v2ray-agent/sing-box/conf/config/06_hysteria2_inbounds.json
 {
     "inbounds": [
@@ -5401,6 +5431,11 @@ EOF
     ]
 }
 EOF
+        if [[ -n "${hysteria2ObfsPassword}" ]]; then
+            local hysteria2ObfsResult
+            hysteria2ObfsResult=$(jq --arg password "${hysteria2ObfsPassword}" '.inbounds[0].obfs={"type":"salamander","password":$password}' /etc/v2ray-agent/sing-box/conf/config/06_hysteria2_inbounds.json)
+            echo "${hysteria2ObfsResult}" | jq . >/etc/v2ray-agent/sing-box/conf/config/06_hysteria2_inbounds.json
+        fi
     elif [[ -z "$3" ]]; then
         rm /etc/v2ray-agent/sing-box/conf/config/06_hysteria2_inbounds.json >/dev/null 2>&1
     fi
@@ -5852,10 +5887,20 @@ EOF
             multiPort="mport=${port}&"
             multiPortEncode="mport%3D${port}%26"
         fi
+        local obfsQuery=
+        local obfsQueryEncode=
+        local clashMetaObfsContent=
+        if [[ -n "${hysteria2ObfsPassword}" ]]; then
+            obfsQuery="obfs=salamander&obfs-password=${hysteria2ObfsPassword}&"
+            obfsQueryEncode="obfs%3Dsalamander%26obfs-password%3D${hysteria2ObfsPassword}%26"
+            clashMetaObfsContent="
+    obfs: salamander
+    obfs-password: ${hysteria2ObfsPassword}"
+        fi
 
-        echoContent green "    hysteria2://${id}@${currentHost}:${port}?${multiPort}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}\n"
+        echoContent green "    hysteria2://${id}@${currentHost}:${port}?${multiPort}${obfsQuery}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}\n"
         cat <<EOF >>"${outputRoot}/default/${user}" || return 1
-hysteria2://${id}@${currentHost}:${port}?${multiPort}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}
+hysteria2://${id}@${currentHost}:${port}?${multiPort}${obfsQuery}peer=${currentHost}&insecure=0&sni=${currentHost}&alpn=h3#${email}
 EOF
         echoContent yellow " ---> v2rayN(hysteria+TLS)"
         jq -n --arg server "${currentHost}:${port}" --arg password "${id}" --arg host "${currentHost}" \
@@ -5873,7 +5918,7 @@ EOF
         - h3
     sni: ${currentHost}
     up: "${hysteria2ClientUploadSpeed} Mbps"
-    down: "${hysteria2ClientDownloadSpeed} Mbps"
+    down: "${hysteria2ClientDownloadSpeed} Mbps"${clashMetaObfsContent}
 EOF
 
         local hysteria2Node
@@ -5882,7 +5927,7 @@ EOF
         echo "${singBoxSubscribeLocalConfig}" | jq . >"${outputRoot}/sing-box/${user}" || return 1
 
         echoContent yellow " ---> QR code Hysteria(TLS)"
-        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=hysteria2%3A%2F%2F${id}%40${currentHost}%3A${port}%3F${multiPortEncode}peer%3D${currentHost}%26insecure%3D0%26sni%3D${currentHost}%26alpn%3Dh3%23${email}\n"
+        echoContent green "    https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=hysteria2%3A%2F%2F${id}%40${currentHost}%3A${port}%3F${multiPortEncode}${obfsQueryEncode}peer%3D${currentHost}%26insecure%3D0%26sni%3D${currentHost}%26alpn%3Dh3%23${email}\n"
 
     elif [[ "${type}" == "vlessReality" ]]; then
         local realityServerName=${xrayVLESSRealityServerName}
